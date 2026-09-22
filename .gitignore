@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Secrets — never commit
+verify_bot/config.json
+
+# Data files generated at runtime
+verify_bot/verified.json
+verify_bot/reminders.json
+verify_bot/verify_log.csv
+
+# Local students list
+M1 SII A (Liste Affichage).xlsx
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

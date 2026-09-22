@@ -1,0 +1,28 @@
+{
+    "discord_token": "YOUR_BOT_TOKEN_HERE",
+    "sync_guild_id": 0,
+    "admin_user_ids": [],
+    "admin_role": "Admin",
+    "verified_role": "MIV",
+    "verified_role_id": null,
+    "unverified_role": "Visitor",
+    "unverified_role_id": null,
+    "mod_channel_id": 0,
+    "verify_channel_id": 0,
+    "report_channel_id": 0,
+    "log_channel_id": 0,
+    "startup_channel_ids": [],
+    "message_log_channel_id": 0,
+    "group_role_format": "G{group}",
+    "group_role_ids": {
+        "1": 0,
+        "2": 0,
+        "3": 0
+    },
+    "info_messages": {
+        "planning": "🗓️ **Planning**\n- TD: Sunday 8h–10h, Room 12",
+        "devoirs": "📝 **Devoirs**\n- Homework due every Sunday",
+        "reglement": "📜 **Règlement**\n- Be respectful"
+    },
+    "xlsx_file": "../M1 SII A (Liste Affichage).xlsx"
+}
