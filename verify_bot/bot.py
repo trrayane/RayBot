@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 
 from students import load_students
 
@@ -20,6 +22,8 @@ VERIFIED_PATH = BASE_DIR / "verified.json"
 VERIFY_LOG_PATH = BASE_DIR / "verify_log.csv"
 REMINDERS_PATH = BASE_DIR / "reminders.json"
 MESSAGE_STATS_PATH = BASE_DIR / "message_stats.json"
+WARNS_PATH = BASE_DIR / "warns.json"
+WELCOME_BG_DEFAULT = BASE_DIR / "welcome_bg.png"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +50,12 @@ REMINDER_MAX_DAYS_AHEAD = 365
 
 # Commands that should NOT be echoed into the log channel (pure lookups, no action taken)
 NO_LOG_COMMANDS = {"Voir informations"}
+
+# ---- anti-invite-link protection ----
+DISCORD_INVITE_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/[a-zA-Z0-9-]+",
+    re.IGNORECASE,
+)
 
 
 # ---------------- helpers ----------------
@@ -142,6 +152,27 @@ def save_message_stats(data: dict):
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as exc:
         log.warning("Could not write message_stats.json: %s", exc)
+
+
+def load_warns() -> dict:
+    """{user_id_str: [ {"id": str, "reason": str, "by": str, "by_id": str, "at": iso}, ... ]}"""
+    if WARNS_PATH.exists():
+        try:
+            with open(WARNS_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as exc:
+            log.warning("Could not read warns.json: %s", exc)
+    return {}
+
+
+def save_warns(data: dict):
+    try:
+        with open(WARNS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        log.warning("Could not write warns.json: %s", exc)
 
 
 def log_verification(user_id: int, username: str, display_name: str, matricule: str,
@@ -440,6 +471,101 @@ async def _send_message_log(bot, text: str, guild: discord.Guild | None = None,
         log.warning("Failed to send message log: %s", exc)
 
 
+def _find_a_font(size: int) -> ImageFont.FreeTypeFont:
+    """Try a few common font paths (Windows/Linux), fall back to PIL's default bitmap font."""
+    candidates = [
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def _make_gradient_background(width: int, height: int) -> Image.Image:
+    """Generates a simple dark blue->purple gradient as a fallback background
+    when no custom welcome_bg image has been uploaded yet."""
+    img = Image.new("RGB", (width, height), "#1e1f29")
+    top = (35, 39, 90)
+    bottom = (88, 40, 130)
+    for y in range(height):
+        t = y / height
+        r = int(top[0] + (bottom[0] - top[0]) * t)
+        g = int(top[1] + (bottom[1] - top[1]) * t)
+        b = int(top[2] + (bottom[2] - top[2]) * t)
+        ImageDraw.Draw(img).line([(0, y), (width, y)], fill=(r, g, b))
+    return img
+
+
+async def _generate_welcome_image(bot, member: discord.Member) -> io.BytesIO:
+    """Builds a welcome banner: background image (or gradient fallback) + the
+    member's circular avatar + their name + the server's new member count."""
+    width, height = 1000, 400
+
+    bg_filename = bot.config.get("welcome_background", "welcome_bg.png")
+    bg_path = BASE_DIR / bg_filename
+    if bg_path.exists():
+        bg = Image.open(bg_path).convert("RGB")
+        bg = ImageOps.fit(bg, (width, height), Image.LANCZOS)
+        # Darken a bit so white text stays readable over any photo.
+        overlay = Image.new("RGB", (width, height), (0, 0, 0))
+        bg = Image.blend(bg, overlay, 0.35)
+    else:
+        bg = _make_gradient_background(width, height)
+
+    # Avatar: fetch, resize, make circular, add a white ring.
+    avatar_bytes = await member.display_avatar.replace(size=256).read()
+    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+    avatar_size = 180
+    avatar = avatar.resize((avatar_size, avatar_size), Image.LANCZOS)
+    mask = Image.new("L", (avatar_size, avatar_size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+    avatar.putalpha(mask)
+
+    canvas = bg.convert("RGBA")
+    ax = (width - avatar_size) // 2
+    ay = 45
+    ring_pad = 6
+    ring = Image.new("L", (avatar_size + ring_pad * 2, avatar_size + ring_pad * 2), 0)
+    ImageDraw.Draw(ring).ellipse((0, 0, ring.size[0], ring.size[1]), fill=255)
+    ring_img = Image.new("RGBA", ring.size, (255, 255, 255, 255))
+    ring_img.putalpha(ring)
+    canvas.alpha_composite(ring_img, (ax - ring_pad, ay - ring_pad))
+    canvas.alpha_composite(avatar, (ax, ay))
+
+    draw = ImageDraw.Draw(canvas)
+    title_font = _find_a_font(46)
+    name_font = _find_a_font(32)
+    sub_font = _find_a_font(22)
+
+    title_text = "BIENVENUE"
+    tb = draw.textbbox((0, 0), title_text, font=title_font)
+    draw.text(((width - (tb[2] - tb[0])) / 2, ay + avatar_size + 20), title_text,
+              font=title_font, fill="white")
+
+    name_text = member.display_name
+    nb = draw.textbbox((0, 0), name_text, font=name_font)
+    draw.text(((width - (nb[2] - nb[0])) / 2, ay + avatar_size + 80), name_text,
+              font=name_font, fill=(230, 230, 255))
+
+    sub_text = f"Membre #{member.guild.member_count} · {member.guild.name}"
+    sb = draw.textbbox((0, 0), sub_text, font=sub_font)
+    draw.text(((width - (sb[2] - sb[0])) / 2, ay + avatar_size + 125), sub_text,
+              font=sub_font, fill=(200, 200, 220))
+
+    buf = io.BytesIO()
+    canvas.convert("RGB").save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
 def _dedupe_block(bot, user_id: int, mat: str) -> str | None:
     owner = bot._find_user_for_matricule(mat)
     if owner is not None and owner != str(user_id):
@@ -646,6 +772,8 @@ class VerifyBot(commands.Bot):
         }
         self.spam_state: dict = {}
         self.reminders: list = load_reminders()
+        self.message_stats: dict = load_message_stats()
+        self.warns: dict = load_warns()
         self.reload_students()
         self._register_commands()
         self.tree.on_error = self.on_tree_error
@@ -714,6 +842,12 @@ class VerifyBot(commands.Bot):
         if not due:
             return
 
+        # Mark reminders as consumed and persist BEFORE sending the DMs.
+        # This way, even if the bot crashes/restarts mid-send, a fired
+        # reminder can never be re-sent on the next startup.
+        self.reminders = keep
+        save_reminders(self.reminders)
+
         log.info("Firing %d reminder(s)", len(due))
         for r in due:
             try:
@@ -738,9 +872,6 @@ class VerifyBot(commands.Bot):
             except discord.HTTPException as exc:
                 log.warning("Reminder send failed: %s", exc)
 
-        self.reminders = keep
-        save_reminders(self.reminders)
-
     @reminder_loop.before_loop
     async def before_reminder_loop(self):
         await self.wait_until_ready()
@@ -753,6 +884,35 @@ class VerifyBot(commands.Bot):
         if message.guild is None:
             log.info("[DM] <%s>: %s", message.author, message.content)
             return
+
+        self._track_message(message)
+
+        # ---- anti-invite-link protection (whole server, admins exempt) ----
+        if not _is_admin(self, message.author):
+            invite_match = DISCORD_INVITE_RE.search(message.content or "")
+            if invite_match:
+                try:
+                    await message.delete()
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+                try:
+                    warn_msg = await message.channel.send(
+                        f"{message.author.mention} les liens d'invitation Discord ne sont pas autorisés ici."
+                    )
+                    await warn_msg.delete(delay=6)
+                except discord.HTTPException:
+                    pass
+                embed = discord.Embed(
+                    title="🔗 Lien d'invitation supprimé",
+                    description=f"Lien détecté : `{invite_match.group(0)}`",
+                    color=discord.Color.red(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                embed.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)
+                embed.add_field(name="Salon", value=f"#{message.channel.name}", inline=False)
+                embed.set_footer(text=f"ID utilisateur : {message.author.id}")
+                await _send_message_log(self, "", message.guild, embed=embed)
+                return
 
         verify_channel_id = _get_channel_id(self.config, "verify_channel_id")
         if verify_channel_id and message.channel.id == verify_channel_id:
@@ -873,6 +1033,105 @@ class VerifyBot(commands.Bot):
         embed.set_footer(text=f"ID utilisateur : {message.author.id}")
         await _send_message_log(self, "", message.guild, embed=embed)
 
+    async def on_member_join(self, member: discord.Member):
+        log.info("Member joined: %s (%s) in guild %s", member, member.id, member.guild.name)
+        channel_id = _get_channel_id(self.config, "welcome_channel_id")
+        if channel_id is None:
+            return
+        channel = member.guild.get_channel(channel_id)
+        if channel is None:
+            log.warning("Welcome channel %s not found", channel_id)
+            return
+
+        try:
+            buf = await _generate_welcome_image(self, member)
+            file = discord.File(buf, filename="welcome.png")
+            await channel.send(
+                content=f"🎉 Bienvenue {member.mention} sur **{member.guild.name}** ! "
+                        f"Va vite te vérifier dans <#{_get_channel_id(self.config, 'verify_channel_id')}> 🎓"
+                        if self.config.get("verify_channel_id") else
+                        f"🎉 Bienvenue {member.mention} sur **{member.guild.name}** !",
+                file=file,
+            )
+        except Exception as exc:
+            log.warning("Failed to generate/send welcome image for %s: %s", member, exc)
+            try:
+                await channel.send(f"🎉 Bienvenue {member.mention} sur **{member.guild.name}** !")
+            except discord.HTTPException:
+                pass
+
+    async def on_member_remove(self, member: discord.Member):
+        log.info("Member left: %s (%s) from guild %s", member, member.id, member.guild.name)
+        embed = discord.Embed(
+            title="🚪 Un membre a quitté le serveur",
+            color=discord.Color.dark_grey(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+        embed.add_field(name="ID Discord", value=f"`{member.id}`", inline=True)
+        if member.joined_at:
+            embed.add_field(
+                name="Avait rejoint le",
+                value=discord.utils.format_dt(member.joined_at, "R"),
+                inline=True,
+            )
+        roles = [r.mention for r in member.roles if r.name != "@everyone"]
+        if roles:
+            embed.add_field(name="Rôles qu'il avait", value=", ".join(roles), inline=False)
+        mat = self._find_matricule_for_user(member.id)
+        if mat:
+            student = self.students.get(mat)
+            if student:
+                embed.add_field(
+                    name="🎓 Était lié au matricule",
+                    value=f"`{mat}` — {student.full_name}",
+                    inline=False,
+                )
+        embed.set_footer(text=f"ID utilisateur : {member.id}")
+        await _send_message_log(self, "", member.guild, embed=embed)
+
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        if after.bot:
+            return
+        before_roles = set(before.roles)
+        after_roles = set(after.roles)
+        added = after_roles - before_roles
+        removed = before_roles - after_roles
+        if not added and not removed:
+            return
+
+        # Try to find who made the change via the audit log (needs "View Audit Log" perm).
+        actor = None
+        try:
+            async for entry in after.guild.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
+                if entry.target and entry.target.id == after.id:
+                    age = (datetime.now(timezone.utc) - entry.created_at).total_seconds()
+                    if age < 15:
+                        actor = entry.user
+                    break
+        except discord.Forbidden:
+            log.warning("Missing 'View Audit Log' permission — can't tell who changed roles for %s", after)
+        except discord.HTTPException as exc:
+            log.warning("Audit log lookup failed for %s: %s", after, exc)
+
+        embed = discord.Embed(
+            title="🔧 Rôles modifiés",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(name=str(after), icon_url=after.display_avatar.url)
+        if added:
+            embed.add_field(name="➕ Rôle(s) ajouté(s)", value=", ".join(r.mention for r in added), inline=False)
+        if removed:
+            embed.add_field(name="➖ Rôle(s) retiré(s)", value=", ".join(r.mention for r in removed), inline=False)
+        embed.add_field(
+            name="Par",
+            value=str(actor) if actor else "Inconnu (probablement une action du bot, ou permission « Voir le journal d'audit » manquante)",
+            inline=False,
+        )
+        embed.set_footer(text=f"ID utilisateur : {after.id}")
+        await _send_message_log(self, "", after.guild, embed=embed)
+
     async def on_interaction(self, interaction: discord.Interaction):
         if interaction.type != discord.InteractionType.application_command:
             return
@@ -956,6 +1215,18 @@ class VerifyBot(commands.Bot):
 
     def _find_user_for_matricule(self, matricule: str):
         return self.matricule_to_user.get(matricule)
+
+    def _track_message(self, message: discord.Message):
+        """Increment this user's tracked message count and record their last message."""
+        uid = str(message.author.id)
+        entry = self.message_stats.get(uid, {"count": 0})
+        entry["count"] = entry.get("count", 0) + 1
+        entry["last_content"] = (message.content or "*(pas de texte / pièce jointe seule)*")[:300]
+        entry["last_channel"] = message.channel.name if hasattr(message.channel, "name") else "?"
+        entry["last_channel_id"] = message.channel.id
+        entry["last_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.message_stats[uid] = entry
+        save_message_stats(self.message_stats)
 
     # ---------- commands ----------
 
@@ -1048,14 +1319,14 @@ class VerifyBot(commands.Bot):
             # ---- Dates ----
             embed.add_field(
                 name="Compte créé le",
-                value=discord.utils.format_dt(member.created_at, "F") + "\n" + discord.utils.format_dt(member.created_at, "R"),
-                inline=True,
+                value=discord.utils.format_dt(member.created_at, "F") + " (" + discord.utils.format_dt(member.created_at, "R") + ")",
+                inline=False,
             )
             if member.joined_at:
                 embed.add_field(
                     name="A rejoint le serveur le",
-                    value=discord.utils.format_dt(member.joined_at, "F") + "\n" + discord.utils.format_dt(member.joined_at, "R"),
-                    inline=True,
+                    value=discord.utils.format_dt(member.joined_at, "F") + " (" + discord.utils.format_dt(member.joined_at, "R") + ")",
+                    inline=False,
                 )
             if member.premium_since:
                 embed.add_field(
@@ -1090,6 +1361,34 @@ class VerifyBot(commands.Bot):
                 embed.add_field(
                     name="⏳ Actuellement timeout jusqu'à",
                     value=discord.utils.format_dt(member.timed_out_until, "F"),
+                    inline=False,
+                )
+
+            # ---- Activité sur le serveur (suivie par le bot) ----
+            stats = self.message_stats.get(str(member.id))
+            if stats:
+                embed.add_field(
+                    name="💬 Messages envoyés (depuis que le bot compte)",
+                    value=str(stats.get("count", 0)),
+                    inline=True,
+                )
+                try:
+                    last_at = datetime.fromisoformat(stats["last_at"])
+                    last_at_str = discord.utils.format_dt(last_at, "R")
+                except Exception:
+                    last_at_str = "?"
+                embed.add_field(
+                    name="Dernier message",
+                    value=(
+                        f"#{stats.get('last_channel', '?')} · {last_at_str}\n"
+                        f"> {stats.get('last_content', '')}"
+                    ),
+                    inline=False,
+                )
+            else:
+                embed.add_field(
+                    name="💬 Messages envoyés",
+                    value="Aucun message suivi pour l'instant (le comptage a démarré au dernier redémarrage du bot).",
                     inline=False,
                 )
 
@@ -1455,6 +1754,156 @@ class VerifyBot(commands.Bot):
                 return
             await interaction.response.send_message(text, ephemeral=True)
 
+        # --------- /email ---------
+
+        DEFAULT_EMAILS_TEXT = (
+            "📧 **Contacts des responsables de modules**\n\n"
+            "**Mail de MR.Benchaiba** responsable du cours/TD/TP du module SE :\n"
+            "mabenchaiba@gmail.com\n\n"
+            "**Mail de Mme.Djiroune** responsable du cours du module ABDD :\n"
+            "djirahma@yahoo.fr\n\n"
+            "**Mail de Mme.Sebai** responsable du cours/TP du module RP :\n"
+            "meriem.sebai.ms@gmail.com\n\n"
+            "**Mail de Mme.Mebtouche** responsable du cours/TD du module TAI :\n"
+            "nawel.meb.5@gmail.com\n\n"
+            "**Mail de Mme.Bensaou** responsable du cours du module Algo :\n"
+            "bensaou.nacera@gmail.com\n\n"
+            "**Mail de MR.Djouada** responsable du TD du module Algo :\n"
+            "moussa.nadjib@gmail.com\n\n"
+            "**Mail de MR.Larabi** responsable du cours du module multimédia :\n"
+            "slimane.larabi@gmail.com"
+        )
+
+        @self.tree.command(name="email", description="Affiche les mails des responsables de modules")
+        async def email_cmd(interaction: discord.Interaction):
+            text = self.config.get("emails_message", DEFAULT_EMAILS_TEXT)
+            await interaction.response.send_message(text, ephemeral=True)
+
+        # --------- /edt ---------
+
+        @self.tree.command(name="edt", description="Affiche l'emploi du temps de la promo")
+        async def edt(interaction: discord.Interaction):
+            filename = self.config.get("edt_image", "edt.png")
+            path = BASE_DIR / filename
+            if not path.exists():
+                await interaction.response.send_message(
+                    "❌ Aucun emploi du temps n'a encore été configuré. "
+                    "Un admin peut en ajouter un avec `/edt_set`.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                file = discord.File(str(path), filename=path.name)
+                await interaction.response.send_message(file=file, ephemeral=True)
+            except Exception as exc:
+                log.warning("Failed to send edt image: %s", exc)
+                await interaction.response.send_message(
+                    "❌ Impossible d'envoyer l'image de l'emploi du temps. Contacte un admin.",
+                    ephemeral=True,
+                )
+
+        # --------- /edt_set (admin) ---------
+
+        @self.tree.command(name="edt_set", description="Met à jour l'image de l'emploi du temps (admin)")
+        @app_commands.describe(image="L'image de l'emploi du temps (PNG/JPG)")
+        async def edt_set(interaction: discord.Interaction, image: discord.Attachment):
+            if not _is_admin(self, interaction.user):
+                await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+                return
+            if not (image.content_type or "").startswith("image/"):
+                await interaction.response.send_message(
+                    "❌ Le fichier envoyé n'est pas une image.", ephemeral=True
+                )
+                return
+
+            filename = self.config.get("edt_image", "edt.png")
+            ext = Path(image.filename).suffix or ".png"
+            filename = str(Path(filename).with_suffix(ext))
+            path = BASE_DIR / filename
+
+            await interaction.response.defer(ephemeral=True)
+            try:
+                await image.save(path)
+            except Exception as exc:
+                await interaction.followup.send(f"❌ Échec de la sauvegarde : {exc}", ephemeral=True)
+                return
+
+            if filename != self.config.get("edt_image"):
+                self.config["edt_image"] = filename
+                try:
+                    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                        json.dump(self.config, f, indent=4, ensure_ascii=False)
+                except Exception as exc:
+                    log.warning("Could not persist edt_image to config.json: %s", exc)
+
+            await interaction.followup.send(
+                f"✅ Emploi du temps mis à jour (`{filename}`). Teste avec `/edt`.", ephemeral=True
+            )
+            await _send_log(
+                self,
+                f"🗓️ **Emploi du temps mis à jour** par {interaction.user.mention}",
+                interaction.guild,
+            )
+
+        # --------- /welcome_set (admin) ---------
+
+        @self.tree.command(name="welcome_set", description="Met à jour le fond de l'image de bienvenue (admin)")
+        @app_commands.describe(image="L'image de fond pour le message de bienvenue (PNG/JPG)")
+        async def welcome_set(interaction: discord.Interaction, image: discord.Attachment):
+            if not _is_admin(self, interaction.user):
+                await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+                return
+            if not (image.content_type or "").startswith("image/"):
+                await interaction.response.send_message(
+                    "❌ Le fichier envoyé n'est pas une image.", ephemeral=True
+                )
+                return
+
+            filename = self.config.get("welcome_background", "welcome_bg.png")
+            ext = Path(image.filename).suffix or ".png"
+            filename = str(Path(filename).with_suffix(ext))
+            path = BASE_DIR / filename
+
+            await interaction.response.defer(ephemeral=True)
+            try:
+                await image.save(path)
+            except Exception as exc:
+                await interaction.followup.send(f"❌ Échec de la sauvegarde : {exc}", ephemeral=True)
+                return
+
+            if filename != self.config.get("welcome_background"):
+                self.config["welcome_background"] = filename
+                try:
+                    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                        json.dump(self.config, f, indent=4, ensure_ascii=False)
+                except Exception as exc:
+                    log.warning("Could not persist welcome_background to config.json: %s", exc)
+
+            await interaction.followup.send(
+                f"✅ Fond de bienvenue mis à jour (`{filename}`). Teste avec `/welcome_test`.", ephemeral=True
+            )
+
+        # --------- /welcome_test (admin) ---------
+
+        @self.tree.command(name="welcome_test", description="Prévisualiser le message de bienvenue (admin)")
+        async def welcome_test(interaction: discord.Interaction):
+            if not _is_admin(self, interaction.user):
+                await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+                return
+            channel_id = _get_channel_id(self.config, "welcome_channel_id")
+            if channel_id is None:
+                await interaction.response.send_message(
+                    "❌ `welcome_channel_id` n'est pas configuré dans `config.json`.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                buf = await _generate_welcome_image(self, interaction.user)
+                file = discord.File(buf, filename="welcome_preview.png")
+                await interaction.followup.send("Aperçu de l'image de bienvenue :", file=file, ephemeral=True)
+            except Exception as exc:
+                await interaction.followup.send(f"❌ Erreur de génération : {exc}", ephemeral=True)
+
         # --------- /rappel ---------
 
         @self.tree.command(name="rappel", description="Set a personal reminder — the bot will DM you at that time")
@@ -1574,6 +2023,35 @@ class VerifyBot(commands.Bot):
             self.reminders = [r for r in self.reminders if r.get("id") != rid]
             save_reminders(self.reminders)
             await interaction.response.send_message(f"✅ Reminder `{rid}` cancelled.", ephemeral=True)
+
+        # --------- /tous_les_rappels (admin) ---------
+
+        @self.tree.command(name="tous_les_rappels", description="List every pending reminder, from every user (admin)")
+        async def tous_les_rappels(interaction: discord.Interaction):
+            if not _is_admin(self, interaction.user):
+                await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+                return
+            if not self.reminders:
+                await interaction.response.send_message("Aucun rappel en attente.", ephemeral=True)
+                return
+            ordered = sorted(self.reminders, key=lambda r: r.get("when", ""))
+            lines = []
+            for r in ordered[:40]:
+                try:
+                    when = datetime.fromisoformat(r["when"])
+                    unix = int(when.timestamp())
+                    when_str = f"<t:{unix}:f> (<t:{unix}:R>)"
+                except Exception:
+                    when_str = r.get("when", "?")
+                msg = (r.get("message", "") or "")[:60]
+                lines.append(f"`{r['id']}` — <@{r.get('user_id')}> — {when_str} — {msg}")
+            header = f"⏰ **{len(self.reminders)} rappel(s) en attente au total**"
+            if len(self.reminders) > 40:
+                header += " (affichage des 40 premiers, triés par date)"
+            await interaction.response.send_message(
+                header + "\n" + "\n".join(lines) + "\n\nUtilise `/annuler_rappel <id>` pour en annuler un.",
+                ephemeral=True,
+            )
 
         # --------- /signaler ---------
 
@@ -1993,6 +2471,92 @@ class VerifyBot(commands.Bot):
                 ephemeral=True,
             )
 
+        # --------- /sondage ---------
+
+        @self.tree.command(name="sondage", description="Créer un sondage avec réactions emoji")
+        @app_commands.describe(
+            question="La question du sondage",
+            option1="Option 1 (laisse vide pour un sondage Oui/Non simple)",
+            option2="Option 2",
+            option3="Option 3",
+            option4="Option 4",
+            option5="Option 5",
+        )
+        async def sondage(interaction: discord.Interaction, question: str,
+                          option1: str = None, option2: str = None,
+                          option3: str = None, option4: str = None, option5: str = None):
+            options = [o for o in [option1, option2, option3, option4, option5] if o]
+
+            if not options:
+                embed = discord.Embed(
+                    title="📊 Sondage",
+                    description=f"**{question}**",
+                    color=discord.Color.blurple(),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                embed.set_footer(text=f"Sondage créé par {interaction.user}")
+                await interaction.response.send_message(embed=embed)
+                msg = await interaction.original_response()
+                for emoji in ("👍", "👎"):
+                    await msg.add_reaction(emoji)
+                return
+
+            if len(options) < 2:
+                await interaction.response.send_message(
+                    "❌ Donne au moins 2 options, ou aucune pour un sondage Oui/Non simple.",
+                    ephemeral=True,
+                )
+                return
+
+            number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+            lines = [f"{number_emojis[i]} {opt}" for i, opt in enumerate(options)]
+            embed = discord.Embed(
+                title="📊 Sondage",
+                description=f"**{question}**\n\n" + "\n".join(lines),
+                color=discord.Color.blurple(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_footer(text=f"Sondage créé par {interaction.user}")
+            await interaction.response.send_message(embed=embed)
+            msg = await interaction.original_response()
+            for i in range(len(options)):
+                await msg.add_reaction(number_emojis[i])
+
+        # --------- /classement ---------
+
+        @self.tree.command(name="classement", description="Top 10 des étudiants les plus actifs (messages)")
+        async def classement(interaction: discord.Interaction):
+            if not self.message_stats:
+                await interaction.response.send_message(
+                    "Aucune activité suivie pour l'instant (le comptage démarre au lancement du bot).",
+                    ephemeral=True,
+                )
+                return
+
+            ranked = sorted(
+                self.message_stats.items(),
+                key=lambda kv: kv[1].get("count", 0),
+                reverse=True,
+            )[:10]
+
+            medals = ["🥇", "🥈", "🥉"]
+            lines = []
+            for i, (uid, data) in enumerate(ranked):
+                rank = medals[i] if i < 3 else f"`#{i + 1}`"
+                mat = self._find_matricule_for_user(int(uid))
+                student = self.students.get(mat) if mat else None
+                name_suffix = f" — {student.full_name}" if student else ""
+                lines.append(f"{rank} <@{uid}>{name_suffix} — **{data.get('count', 0)}** messages")
+
+            embed = discord.Embed(
+                title="🏆 Classement — Membres les plus actifs",
+                description="\n".join(lines),
+                color=discord.Color.gold(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_footer(text="Basé sur les messages suivis depuis le dernier démarrage du bot")
+            await interaction.response.send_message(embed=embed)
+
         # --------- /stats ---------
 
         @self.tree.command(name="stats", description="Show bot statistics")
@@ -2186,11 +2750,19 @@ class VerifyBot(commands.Bot):
                 "`/annuler_rappel <id>` — Cancel a reminder\n"
                 "`/signaler <message>` — Send a report to the mod team\n"
                 "`/info <topic>` — Planning, homework, rules\n"
+                "`/edt` — Voir l'emploi du temps\n"
+                "`/email` — Voir les mails des responsables de modules\n"
+                "`/sondage <question> [options...]` — Créer un sondage\n"
+                "`/classement` — Top 10 des membres les plus actifs\n"
                 "`/stats` — Bot statistics\n"
                 "`/help` — This message\n\n"
                 "**Admins only**\n"
+                "`/welcome_set <image>` — Fond du message de bienvenue\n"
+                "`/welcome_test` — Prévisualiser le message de bienvenue\n"
                 "`/groupe <n>` — List ALL students in TD n\n"
                 "`/timeout <user> <min>` · `/untimeout <user>`\n"
+                "`/edt_set <image>` — Mettre à jour l'emploi du temps\n"
+                "`/tous_les_rappels` — Voir tous les rappels en attente\n"
                 "`/backup` · `/reload_config` · `/creer_roles_groupes` · `/sync_groupes` · `/verify_log`\n"
                 "`/check` · `/search` · `/refresh` · `/unverify` · `/export` · `/list_commands`",
                 ephemeral=True,

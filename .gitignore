@@ -13,6 +13,8 @@ verify_bot/config.json
 verify_bot/verified.json
 verify_bot/reminders.json
 verify_bot/verify_log.csv
+verify_bot/message_stats.json
+verify_bot/warns.json
 
 # Local students list
 M1 SII A (Liste Affichage).xlsx
