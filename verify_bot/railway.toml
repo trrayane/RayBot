@@ -1,0 +1,7 @@
+name: raybot
+type: worker
+build:
+  builder: nixpacks
+  buildpack: python
+start: python -u bot.py
+plan: free
