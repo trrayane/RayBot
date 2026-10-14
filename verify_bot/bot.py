@@ -108,8 +108,15 @@ def save_verified(data: dict):
 
 
 def load_config_file() -> dict:
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            config = json.load(f)
+    else:
+        config = {}
+    for key, val in os.environ.items():
+        if key.startswith("CONFIG_"):
+            config[key[7:].lower()] = val
+    return config
 
 
 def load_reminders() -> list:
@@ -2772,9 +2779,6 @@ class VerifyBot(commands.Bot):
 # ---------------- entry point ----------------
 
 def main():
-    if not CONFIG_PATH.exists():
-        log.error("config.json not found. Copy config.example.json to config.json and fill it in.")
-        raise SystemExit(1)
     config = load_config_file()
 
     token = os.environ.get("DISCORD_TOKEN") or config.get("discord_token")
