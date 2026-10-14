@@ -21,14 +21,15 @@ class Student:
 
     @property
     def is_sii(self) -> bool:
-        return (self.specialite or "").strip().upper() in ("SII", "MIV", "MIV STUDENT")
+        return (self.specialite or "").strip().upper() in ("SII", "IV", "MIV", "MIV STUDENT")
 
     @property
     def is_admis(self) -> bool:
-        return (self.etat or "").strip().upper() == "ADM"
+        # Le statut n'est plus vérifié : tout étudiant de la liste est accepté.
+        return True
 
 
-def load_students(path: str) -> dict[str, Student]:
+def load_students(path: str) -> tuple[dict[str, Student], int]:
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
@@ -56,7 +57,7 @@ def load_students(path: str) -> dict[str, Student]:
         prenom = str(row[6]) if row[6] is not None else ""
         etat = str(row[7]) if row[7] is not None else ""
         groupe_td = _num(row[8])
-        groupe_tp = _num(row[9])
+        groupe_tp = groupe_td  # le groupe TP est le même que le groupe TD
         students[matricule] = Student(
             numero=str(int(numero)) if isinstance(numero, (int, float)) else str(numero),
             palier=palier,
