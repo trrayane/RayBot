@@ -1,0 +1,4 @@
+entrypoint = "bot.py"
+modules = ["python-3.12"]
+hidden = [".config", "venv"]
+run = "python bot.py"
